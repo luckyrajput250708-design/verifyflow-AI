@@ -1,59 +1,40 @@
-import re
 from io import BytesIO
 
 import pandas as pd
 import streamlit as st
 from pypdf import PdfReader
 
-
-st.set_page_config(
-    page_title="VerifyFlow AI",
-    page_icon="🔎",
-    layout="wide",
-)
+st.set_page_config(page_title="VerifyFlow AI", page_icon="🔎", layout="wide")
 
 st.title("🔎 VerifyFlow AI")
 st.subheader("Supplier Document Discrepancy Detection")
-st.write(
-    "Compare purchase orders, supplier invoices, "
-    "and delivery receipts using PDF text extraction."
-)
+st.write("Compare purchase orders, supplier invoices, and delivery receipts.")
 
-st.warning(
-    "Prototype: review all extracted values before relying on a report. "
-    "Only text-based PDFs with the supported row format are parsed."
+st.info(
+    "Supports text-based PDFs with product rows formatted as: "
+    "Product name | Quantity | Unit Price. Scanned PDFs need OCR."
 )
 
 
 def extract_pdf_text(uploaded_file):
-    """Extract selectable text from a PDF upload."""
     reader = PdfReader(BytesIO(uploaded_file.getvalue()))
 
     if reader.is_encrypted:
-        raise ValueError(
-            "This PDF is password-protected. Upload an unlocked PDF."
-        )
+        raise ValueError("PDF is password-protected.")
 
-    pages = []
-    for page in reader.pages:
-        pages.append(page.extract_text() or "")
-
-    text = "\n".join(pages).strip()
+    text = "\n".join(
+        page.extract_text() or "" for page in reader.pages
+    ).strip()
 
     if not text:
         raise ValueError(
-            "No selectable text was found. The PDF may be scanned "
-            "and require OCR."
+            "No selectable text found. This PDF may be scanned."
         )
 
     return text
 
 
-def parse_product_lines(text):
-    """
-    Read product lines in this format:
-    Product name | quantity | unit price
-    """
+def parse_product_lines(text, label):
     rows = []
 
     for line in text.splitlines():
@@ -62,12 +43,10 @@ def parse_product_lines(text):
         if len(parts) != 3:
             continue
 
-        item, quantity_text, price_text = parts
+        name, qty_text, price_text = parts
 
         try:
-            quantity = float(
-                quantity_text.replace(",", "")
-            )
+            qty = float(qty_text.replace(",", ""))
             price = float(
                 price_text.replace(",", "")
                 .replace("₹", "")
@@ -77,32 +56,33 @@ def parse_product_lines(text):
         except ValueError:
             continue
 
-        if item and quantity >= 0 and price >= 0:
-            rows.append(
-                {
-                    "Product": item,
-                    "Quantity": quantity,
-                    "Unit Price": price,
-                }
-            )
+        if name and qty >= 0 and price >= 0:
+            rows.append({
+                "Product": name,
+                "Quantity": qty,
+                "Unit Price": price,
+            })
 
-    return pd.DataFrame(
-        rows,
-        columns=["Product", "Quantity", "Unit Price"],
-    )
+    if not rows:
+        raise ValueError(
+            f"No product rows found in {label}. "
+            "Expected: Product name | Quantity | Unit Price"
+        )
+
+    return pd.DataFrame(rows)
 
 
-def normalize_products(frame):
-    """Normalize product names and numeric fields."""
+def normalize(frame):
     result = frame.copy()
 
-    result["Product"] = result["Product"].fillna("").astype(str).str.strip()
+    result["Product"] = (
+        result["Product"].fillna("").astype(str).str.strip()
+    )
     result["Product Key"] = (
         result["Product"].str.casefold().str.replace(
             r"\s+", " ", regex=True
         )
     )
-
     result["Quantity"] = pd.to_numeric(
         result["Quantity"], errors="coerce"
     )
@@ -118,25 +98,13 @@ def normalize_products(frame):
         & (result["Unit Price"] >= 0)
     ]
 
+    if result.empty:
+        raise ValueError("No valid product rows found.")
+
     return result
 
 
-def read_document(uploaded_file, label):
-    """Extract and parse one uploaded document."""
-    text = extract_pdf_text(uploaded_file)
-    products = parse_product_lines(text)
-
-    if products.empty:
-        raise ValueError(
-            f"No supported product rows found in {label}. "
-            "Use: Product name | quantity | unit price"
-        )
-
-    return text, normalize_products(products)
-
-
-def combine_duplicate_products(frame):
-    """Combine repeated rows for the same product."""
+def combine_duplicates(frame):
     return (
         frame.groupby("Product Key", as_index=False)
         .agg(
@@ -147,303 +115,241 @@ def combine_duplicate_products(frame):
     )
 
 
-st.header("1. Upload your documents")
+def compare_documents(po_frame, invoice_frame, delivery_frame=None):
+    po = combine_duplicates(normalize(po_frame)).set_index("Product Key")
+    inv = combine_duplicates(normalize(invoice_frame)).set_index("Product Key")
+
+    delivery = None
+    if delivery_frame is not None:
+        delivery = combine_duplicates(
+            normalize(delivery_frame)
+        ).set_index("Product Key")
+
+    keys = set(po.index) | set(inv.index)
+    if delivery is not None:
+        keys |= set(delivery.index)
+
+    rows = []
+
+    for key in sorted(keys):
+        p = po.loc[key] if key in po.index else None
+        i = inv.loc[key] if key in inv.index else None
+        d = (
+            delivery.loc[key]
+            if delivery is not None and key in delivery.index
+            else None
+        )
+
+        product = (
+            p["Product"] if p is not None
+            else i["Product"] if i is not None
+            else d["Product"]
+        )
+
+        pq = float(p["Quantity"]) if p is not None else None
+        pr = float(p["Unit Price"]) if p is not None else None
+        iq = float(i["Quantity"]) if i is not None else None
+        ir = float(i["Unit Price"]) if i is not None else None
+        dq = float(d["Quantity"]) if d is not None else None
+
+        po_total = pq * pr if p is not None else None
+        inv_total = iq * ir if i is not None else None
+
+        issues = []
+
+        if p is None:
+            issues.append("Not found in purchase order")
+        if i is None:
+            issues.append("Missing from invoice")
+
+        if p is not None and i is not None:
+            if abs(iq - pq) > 0.000001:
+                issues.append("Invoice quantity differs")
+            if abs(ir - pr) > 0.005:
+                issues.append("Unit price differs")
+            if abs(inv_total - po_total) > 0.01:
+                issues.append("Line total differs")
+
+        if delivery is not None:
+            if d is None:
+                issues.append("Missing from delivery receipt")
+            elif p is not None and abs(dq - pq) > 0.000001:
+                issues.append("Delivered quantity differs from PO")
+
+        rows.append({
+            "Product": product,
+            "PO Quantity": pq,
+            "Invoice Quantity": iq,
+            "Delivered Quantity": dq,
+            "PO Unit Price": pr,
+            "Invoice Unit Price": ir,
+            "PO Total": po_total,
+            "Invoice Total": inv_total,
+            "Quantity Difference (Invoice - PO)": (
+                iq - pq if p is not None and i is not None else None
+            ),
+            "Rate Difference (Invoice - PO)": (
+                ir - pr if p is not None and i is not None else None
+            ),
+            "Total Difference (Invoice - PO)": (
+                inv_total - po_total
+                if p is not None and i is not None else None
+            ),
+            "Delivery Difference (Delivered - PO)": (
+                dq - pq if p is not None and d is not None else None
+            ),
+            "Review Status": (
+                "; ".join(issues) if issues else "No discrepancy detected"
+            ),
+        })
+
+    return pd.DataFrame(rows)
+
+
+if "vf_data" not in st.session_state:
+    st.session_state["vf_data"] = None
+
+if "vf_report" not in st.session_state:
+    st.session_state["vf_report"] = None
+
+
+st.header("1. Upload documents")
 
 po_file = st.file_uploader(
-    "Purchase Order PDF (required)",
-    type=["pdf"],
-    key="po_upload",
+    "Purchase Order PDF (required)", type=["pdf"], key="po_upload"
 )
-
 invoice_file = st.file_uploader(
-    "Supplier Invoice PDF (required)",
-    type=["pdf"],
-    key="invoice_upload",
+    "Supplier Invoice PDF (required)", type=["pdf"], key="invoice_upload"
 )
-
 delivery_file = st.file_uploader(
-    "Delivery Receipt PDF (optional)",
-    type=["pdf"],
-    key="delivery_upload",
+    "Delivery Receipt PDF (optional)", type=["pdf"], key="delivery_upload"
 )
 
-st.info(
-    "Supported product line example: USB Keyboard | 100 | 500.00"
-)
-
-if st.button("Extract and compare documents", type="primary"):
-    if not po_file or not invoice_file:
-        st.error(
-            "Please upload both a Purchase Order PDF "
-            "and a Supplier Invoice PDF."
-        )
+if st.button("Extract PDFs and prepare comparison", type="primary"):
+    if po_file is None or invoice_file is None:
+        st.error("Upload both the Purchase Order and Supplier Invoice PDFs.")
     else:
         try:
-            po_text, po_data = read_document(
-                po_file, "the purchase order"
-            )
-            invoice_text, invoice_data = read_document(
-                invoice_file, "the supplier invoice"
-            )
+            po_text = extract_pdf_text(po_file)
+            invoice_text = extract_pdf_text(invoice_file)
 
-            delivery_data = None
+            po_data = parse_product_lines(po_text, "purchase order")
+            invoice_data = parse_product_lines(invoice_text, "supplier invoice")
+
             delivery_text = ""
+            delivery_data = None
 
-            if delivery_file:
-                delivery_text, delivery_data = read_document(
-                    delivery_file, "the delivery receipt"
+            if delivery_file is not None:
+                delivery_text = extract_pdf_text(delivery_file)
+                delivery_data = parse_product_lines(
+                    delivery_text, "delivery receipt"
                 )
 
-            st.success("PDF text extracted successfully.")
+            st.session_state["vf_data"] = {
+                "po_text": po_text,
+                "invoice_text": invoice_text,
+                "delivery_text": delivery_text,
+                "po_data": po_data,
+                "invoice_data": invoice_data,
+                "delivery_data": delivery_data,
+            }
 
-            with st.expander("Review extracted PDF text"):
-                st.markdown("**Purchase Order**")
-                st.text(po_text)
+            st.session_state["vf_report"] = None
+            st.success("PDFs extracted successfully.")
 
-                st.markdown("**Supplier Invoice**")
-                st.text(invoice_text)
+        except Exception as exc:
+            st.session_state["vf_data"] = None
+            st.session_state["vf_report"] = None
+            st.error(f"Could not process PDFs: {exc}")
 
-                if delivery_file:
-                    st.markdown("**Delivery Receipt**")
-                    st.text(delivery_text)
 
-            st.header("2. Review extracted product data")
+data = st.session_state["vf_data"]
 
-            st.caption(
-                "Check the values below. Correct any extraction "
-                "errors before generating the report."
-            )
+if data is not None:
+    with st.expander("Review extracted PDF text"):
+        st.markdown("**Purchase Order**")
+        st.text(data["po_text"])
+        st.markdown("**Supplier Invoice**")
+        st.text(data["invoice_text"])
 
-            po_data = st.data_editor(
-                po_data[["Product", "Quantity", "Unit Price"]],
-                num_rows="dynamic",
-                use_container_width=True,
-                key="po_editor",
-            )
+        if data["delivery_text"]:
+            st.markdown("**Delivery Receipt**")
+            st.text(data["delivery_text"])
 
-            invoice_data = st.data_editor(
-                invoice_data[["Product", "Quantity", "Unit Price"]],
-                num_rows="dynamic",
-                use_container_width=True,
-                key="invoice_editor",
-            )
+    st.header("2. Review extracted product data")
+    st.caption("Check the values before generating the report.")
 
-            if delivery_data is not None:
-                st.markdown("**Delivery receipt data**")
-
-                delivery_data = st.data_editor(
-                    delivery_data[
-                        ["Product", "Quantity", "Unit Price"]
-                    ],
-                    num_rows="dynamic",
-                    use_container_width=True,
-                    key="delivery_editor",
-                )
-
-            if st.button("Generate discrepancy report"):
-                po = normalize_products(po_data)
-                invoice = normalize_products(invoice_data)
-
-                if po.empty or invoice.empty:
-                    st.error(
-                        "Purchase order and invoice must each contain "
-                        "at least one valid product row."
-                    )
-                    st.stop()
-
-                po = combine_duplicate_products(po)
-                invoice = combine_duplicate_products(invoice)
-
-                po = po.rename(
-                    columns={
-                        "Product": "PO Product",
-                        "Quantity": "PO Quantity",
-                        "Unit Price": "PO Unit Price",
-                    }
-                )
-
-                invoice = invoice.rename(
-                    columns={
-                        "Product": "Invoice Product",
-                        "Quantity": "Invoice Quantity",
-                        "Unit Price": "Invoice Unit Price",
-                    }
-                )
-
-                report = po.merge(
-                    invoice,
-                    on="Product Key",
-                    how="outer",
-                    indicator="PO Invoice Match",
-                )
-
-                report["Product"] = report["PO Product"].combine_first(
-                    report["Invoice Product"]
-                )
-
-                report["PO Total"] = (
-                    report["PO Quantity"] * report["PO Unit Price"]
-                )
-                report["Invoice Total"] = (
-                    report["Invoice Quantity"]
-                    * report["Invoice Unit Price"]
-                )
-
-                report["Quantity Difference"] = (
-                    report["Invoice Quantity"] - report["PO Quantity"]
-                )
-                report["Rate Difference"] = (
-                    report["Invoice Unit Price"] - report["PO Unit Price"]
-                )
-                report["Total Difference"] = (
-                    report["Invoice Total"] - report["PO Total"]
-                )
-
-                if delivery_data is not None:
-                    delivery = normalize_products(delivery_data)
-
-                    if delivery.empty:
-                        st.error(
-                            "The delivery receipt contains no valid rows."
-                        )
-                        st.stop()
-
-                    delivery = combine_duplicate_products(delivery)
-                    delivery = delivery[
-                        ["Product Key", "Quantity"]
-                    ].rename(
-                        columns={"Quantity": "Delivered Quantity"}
-                    )
-
-                    report = report.merge(
-                        delivery,
-                        on="Product Key",
-                        how="outer",
-                        indicator="Delivery Match",
-                    )
-
-                    report["Product"] = (
-                        report["Product"].combine_first(
-                            report["Product Key"]
-                        )
-                    )
-
-                    report["Delivered Quantity Difference"] = (
-                        report["Delivered Quantity"]
-                        - report["PO Quantity"]
-                    )
-
-                def review_row(row):
-                    issues = []
-
-                    if row["PO Invoice Match"] == "left_only":
-                        issues.append("Missing from invoice")
-                    elif row["PO Invoice Match"] == "right_only":
-                        issues.append("Not found in purchase order")
-                    else:
-                        if abs(row["Quantity Difference"]) > 0.000001:
-                            issues.append("Invoice quantity differs")
-
-                        if abs(row["Rate Difference"]) > 0.005:
-                            issues.append("Unit price differs")
-
-                        if abs(row["Total Difference"]) > 0.01:
-                            issues.append("Line total differs")
-
-                    if delivery_data is not None:
-                        if row["Delivery Match"] == "left_only":
-                            issues.append("Missing from delivery receipt")
-                        elif row["Delivery Match"] == "right_only":
-                            issues.append("Not found in PO/invoice")
-                        elif pd.notna(row["PO Quantity"]):
-                            difference = row[
-                                "Delivered Quantity Difference"
-                            ]
-
-                            if abs(difference) > 0.000001:
-                                issues.append(
-                                    "Delivered quantity differs from PO"
-                                )
-
-                    return (
-                        "; ".join(issues)
-                        if issues
-                        else "No discrepancy detected"
-                    )
-
-                report["Review Status"] = report.apply(
-                    review_row, axis=1
-                )
-
-                output_columns = [
-                    "Product",
-                    "PO Quantity",
-                    "Invoice Quantity",
-                    "PO Unit Price",
-                    "Invoice Unit Price",
-                    "PO Total",
-                    "Invoice Total",
-                    "Quantity Difference",
-                    "Rate Difference",
-                    "Total Difference",
-                ]
-
-                if delivery_data is not None:
-                    output_columns.extend(
-                        [
-                            "Delivered Quantity",
-                            "Delivered Quantity Difference",
-                        ]
-                    )
-
-                output_columns.append("Review Status")
-
-                results = report[output_columns].copy()
-
-                st.header("3. Discrepancy report")
-
-                flagged = results[
-                    results["Review Status"]
-                    != "No discrepancy detected"
-                ]
-
-                col1, col2 = st.columns(2)
-
-                col1.metric("Products reviewed", len(results))
-                col2.metric("Products flagged", len(flagged))
-
-                st.dataframe(
-                    results,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                st.download_button(
-                    "Download discrepancy report (CSV)",
-                    data=results.to_csv(index=False).encode("utf-8"),
-                    file_name="verifyflow_discrepancy_report.csv",
-                    mime="text/csv",
-                )
-
-                if flagged.empty:
-                    st.success("No discrepancies were detected.")
-                else:
-                    st.warning(
-                        "Discrepancies found. Review the flagged rows "
-                        "and supporting documents before taking action."
-                    )
-
-        except Exception as error:
-            st.error(f"Could not process documents: {error}")
-
-else:
-    st.caption(
-        "Upload your documents and tap Extract and compare documents "
-        "to begin."
+    po_edit = st.data_editor(
+        data["po_data"],
+        num_rows="dynamic",
+        use_container_width=True,
+        key="po_editor",
     )
+
+    invoice_edit = st.data_editor(
+        data["invoice_data"],
+        num_rows="dynamic",
+        use_container_width=True,
+        key="invoice_editor",
+    )
+
+    delivery_edit = None
+
+    if data["delivery_data"] is not None:
+        st.markdown("**Delivery receipt data**")
+        delivery_edit = st.data_editor(
+            data["delivery_data"],
+            num_rows="dynamic",
+            use_container_width=True,
+            key="delivery_editor",
+        )
+
+    if st.button("Generate discrepancy report", type="primary"):
+        try:
+            results = compare_documents(
+                po_edit, invoice_edit, delivery_edit
+            )
+            st.session_state["vf_report"] = results
+        except Exception as exc:
+            st.session_state["vf_report"] = None
+            st.error(f"Could not generate report: {exc}")
+
+
+results = st.session_state["vf_report"]
+
+if results is not None:
+    st.header("3. Discrepancy report")
+
+    flagged = results[
+        results["Review Status"] != "No discrepancy detected"
+    ]
+
+    col1, col2 = st.columns(2)
+    col1.metric("Products reviewed", len(results))
+    col2.metric("Products flagged", len(flagged))
+
+    st.dataframe(
+        results,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.download_button(
+        "Download discrepancy report (CSV)",
+        data=results.to_csv(index=False).encode("utf-8"),
+        file_name="verifyflow_discrepancy_report.csv",
+        mime="text/csv",
+    )
+
+    if flagged.empty:
+        st.success("No discrepancies detected.")
+    else:
+        st.warning(
+            "Discrepancies found. Review the flagged rows before taking action."
+        )
 
 st.divider()
 st.caption(
     "VerifyFlow AI prototype | PDF text extraction with pypdf | "
     "Scanned PDF OCR is not included."
-                        )
+    )

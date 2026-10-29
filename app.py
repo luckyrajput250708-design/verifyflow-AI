@@ -152,8 +152,9 @@ if po_file and invoice_file:
                     merged["quantity_invoice"] * merged["unit_price_invoice"]
                 )
 
-                merged["Difference (₹)"] = (
-                    merged["Invoice total (₹)"] - merged["PO total (₹)"
+                
+                 merged["Difference (₹)"] = (
+                     merged["Invoice total (₹)"] - merged["PO total (₹)"]
                 )
 
                 def explain(row):
